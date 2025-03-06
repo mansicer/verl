@@ -34,6 +34,12 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
 
+from typing import Dict
+
+import torch.nn as nn
+from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+
+
 class FSDPVLLMShardingManager(BaseShardingManager):
 
     def __init__(self,
