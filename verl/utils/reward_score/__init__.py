@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # from . import gsm8k, math, prime_math, prime_code
+from verl.utils.reward_score.math_verify import math_verify_reward, qwen_math_reward
+from verl.utils.reward_score.math_verify import train_verification_reward, test_verification_reward
 
 
 def _default_compute_score(data_source, solution_str, ground_truth, extra_info=None):
@@ -33,8 +35,21 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
     elif data_source in ['hiyouga/geometry3k']:
         from . import geo3k
         res = geo3k.compute_score(solution_str, ground_truth)
+    
+    elif data_source.startswith("math-verify"):
+        res = math_verify_reward(data_source, solution_str, ground_truth, extra_info)
+    
+    elif data_source.endswith("verification"):
+        if data_source.startswith("test"):
+            res = test_verification_reward(data_source, solution_str, ground_truth, extra_info)
+        else:
+            res = train_verification_reward(data_source, solution_str, ground_truth, extra_info)
+    
+    elif data_source == "qwen-math":
+        res = qwen_math_reward(data_source, solution_str, ground_truth, extra_info)
+
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Reward score for {data_source} is not implemented")
 
     if isinstance(res, (int, float, bool)):
         return float(res)
