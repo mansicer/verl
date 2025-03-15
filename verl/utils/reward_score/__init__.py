@@ -39,16 +39,16 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
     elif data_source in ['hiyouga/geometry3k']:
         from . import geo3k
         res = geo3k.compute_score(solution_str, ground_truth)
-    
+
     elif data_source.startswith("math-verify"):
         res = math_verify_reward(data_source, solution_str, ground_truth, extra_info)
-    
+
     elif data_source.endswith("verification"):
         if data_source.startswith("test"):
             res = test_verification_reward(data_source, solution_str, ground_truth, extra_info)
         else:
             res = train_verification_reward(data_source, solution_str, ground_truth, extra_info)
-    
+
     elif data_source == "qwen-math":
         res = qwen_math_reward(data_source, solution_str, ground_truth, extra_info)
 

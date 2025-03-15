@@ -47,16 +47,16 @@ def extract_yes_no(text: str) -> bool | None:
 
     pattern = r"Is the answer correct \(Yes/No\)\?\s+(Yes|No)"
     matches = re.findall(pattern, text)
-    
+
     # Return None if no matches or multiple matches found
     if len(matches) != 1:
         return None
-    
+
     # Check if the pattern is at the end of the text
     last_match_pos = text.rfind(f"Is the answer correct (Yes/No)? {matches[0]}")
     if last_match_pos == -1 or last_match_pos + len(f"Is the answer correct (Yes/No)? {matches[0]}") != len(text):
         return None
-    
+
     # Return True for Yes, False for No
     return matches[0] == "Yes"
 
@@ -98,12 +98,12 @@ def train_verification_reward(data_source, solution_str, ground_truth, extra_inf
             # res = 1.0
         else:
             res = 0.0
-    
+
     # penalty for code blocks
     code_blocks = re.findall(r'```python[\s\S]*?```', solution_str)
     if (len(code_blocks) > 0):
         res -= 0.5
-    
+
     # penalty for short response
     if len(solution_str) <= 40:
         res -= 0.5

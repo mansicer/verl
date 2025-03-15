@@ -33,7 +33,6 @@ from .base import BaseShardingManager
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
-
 from typing import Dict
 
 import torch.nn as nn

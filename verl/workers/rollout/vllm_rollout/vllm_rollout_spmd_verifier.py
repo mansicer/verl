@@ -112,7 +112,7 @@ class vLLMRollout(BaseRollout):
         kwargs = dict(
             n=1,
             logprobs=1,  # can be set to 0 and let actor to recompute
-            max_tokens=config.response_length - 20, # for potential verfication tokens
+            max_tokens=config.response_length - 20,  # for potential verfication tokens
         )
 
         # # we may detokenize the result all together later
@@ -198,16 +198,16 @@ class vLLMRollout(BaseRollout):
 
         def get_verification_idx(tokenizer, data_source, response, n_samples):
             from verl.utils.verification.extract import extract_yes_no
-            
+
             data_idx = [i for i, data_source in enumerate(data_source) if data_source == "verification"]
             results = []
             for i in data_idx:
                 for j in range(n_samples):
-                    response_text = tokenizer.decode(response[i*n_samples + j])
+                    response_text = tokenizer.decode(response[i * n_samples + j])
                     if extract_yes_no(response_text) is None:
-                        results.append(i*n_samples + j)
+                        results.append(i * n_samples + j)
             return results
-        
+
         tokenizer = self.inference_engine.get_tokenizer()
         verification_idx = get_verification_idx(tokenizer, data_source, response, n_samples)
 
@@ -225,19 +225,23 @@ class vLLMRollout(BaseRollout):
             sampling_params.stop_token_ids = [tokenizer.encode(token)[0] for token in [" Yes", " No"]]
             sampling_params.include_stop_str_in_output = True
             verification_response = [response[i] for i in verification_idx]
-            verification_idx_list = [idx + list(res) + tokens for idx, res in zip(verification_idx_list, verification_response)]
-            assert len(verification_idx_list) == len(verification_response), f"idx_list: {len(verification_idx_list)}, response: {len(verification_response)}"
+            verification_idx_list = [
+                idx + list(res) + tokens for idx, res in zip(verification_idx_list, verification_response)
+            ]
+            assert len(verification_idx_list) == len(
+                verification_response
+            ), f"idx_list: {len(verification_idx_list)}, response: {len(verification_response)}"
 
             outputs = self.inference_engine.generate(
                 prompts=None,  # because we have already convert it to prompt token id
                 sampling_params=sampling_params,
                 prompt_token_ids=verification_idx_list,
                 use_tqdm=False)
-            
+
             for i, j in enumerate(verification_idx):
                 response[j] += tuple(tokens) + outputs[i].outputs[0].token_ids
             print([tokenizer.decode(res) for res in response])
-        
+
         response = pad_2d_list_to_length(response, self.pad_token_id,
                                          max_length=self.config.response_length).to(idx.device)
 
