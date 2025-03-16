@@ -191,3 +191,7 @@ trainer:
   remove_previous_ckpt_in_save: False
   del_local_ckpt_after_load: False
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+
+hydra:
+  run:
+    dir: ${trainer.default_local_dir}

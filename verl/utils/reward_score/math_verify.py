@@ -40,25 +40,17 @@ def extract_yes_no(text: str) -> bool | None:
     Search for 'Is the answer correct (Yes/No)? Yes|No' pattern in text and return True/False for Yes/No.
     Returns None if no match found, multiple matches found, or if the pattern is not at the end of the text.
     """
-    text = text.strip()
-    # Remove "<|im_end|>" if it's at the end of text
-    if text.endswith("<|im_end|>"):
-        text = text[:-len("<|im_end|>")]
-
     pattern = r"Is the answer correct \(Yes/No\)\?\s+(Yes|No)"
     matches = re.findall(pattern, text)
-
-    # Return None if no matches or multiple matches found
-    if len(matches) != 1:
-        return None
-
-    # Check if the pattern is at the end of the text
-    last_match_pos = text.rfind(f"Is the answer correct (Yes/No)? {matches[0]}")
-    if last_match_pos == -1 or last_match_pos + len(f"Is the answer correct (Yes/No)? {matches[0]}") != len(text):
-        return None
-
-    # Return True for Yes, False for No
-    return matches[0] == "Yes"
+    if len(matches) > 0:
+        return matches[-1] == "Yes"
+    else:
+        result = None
+        if "is correct" in text.lower():
+            result = True
+        elif "is incorrect" in text.lower() or "is not correct" in text.lower() or "is wrong" in text.lower():
+            result = False
+        return result
 
 
 def math_verify_reward(data_source, solution_str, ground_truth, extra_info=None):
@@ -86,24 +78,39 @@ def qwen_math_reward(data_source, solution_str, ground_truth, extra_info=None):
 
 
 def train_verification_reward(data_source, solution_str, ground_truth, extra_info=None):
-    output = extract_yes_no(solution_str)
+    text = solution_str.strip().replace("**", "")
+    # Remove "<|im_end|>" if it's at the end of text
+    if text.endswith("<|im_end|>"):
+        text = text[:-len("<|im_end|>")]
+    
+    output = extract_yes_no(text)
     if output is None:
-        res = -0.5
+        res = -1.0
     else:
-        correct = output == ground_truth
-        if correct:
-            # imbalanced dataset
-            # res = 0.685 if output else 1.852
-            res = 0.5 if output else 2.0
-            # res = 1.0
-        else:
-            res = 0.0
+        res = output == ground_truth
 
-    # penalty for code blocks
-    code_blocks = re.findall(r'```python[\s\S]*?```', solution_str)
-    if (len(code_blocks) > 0):
-        res -= 0.5
+    def check_consistency(text: str) -> bool:
+        pattern = r"Is the answer correct \(Yes/No\)\?\s+(Yes|No)"
+        matches = re.findall(pattern, text)
+        if len(matches) != 1:
+            return False
+        if len(set(matches)) != 1:
+            return False
+        # Check if the pattern is at the end of the text
+        last_match_pos = text.rfind(f"Is the answer correct (Yes/No)? {matches[0]}")
+        if last_match_pos == -1 or last_match_pos + len(f"Is the answer correct (Yes/No)? {matches[0]}") != len(text):
+            return False
 
+        if "is correct" in text.lower() and (not output):
+            return False
+        elif ("is incorrect" in text.lower() or "is not correct" in text.lower() or "is wrong" in text.lower()) and output:
+            return False
+        return True
+    
+    # check if the model gives a consistent answer
+    if not check_consistency(text):
+        res = -0.5
+    
     # penalty for short response
     if len(solution_str) <= 40:
         res -= 0.5

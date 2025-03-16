@@ -27,6 +27,7 @@ from copy import deepcopy
 
 import ray
 import numpy as np
+import wandb
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
@@ -840,9 +841,8 @@ class RayPPOTrainer(object):
                         batch_keys=['input_ids', 'attention_mask', 'position_ids'],
                         non_tensor_batch_keys=['raw_prompt_ids'],
                     )
-                # NOTE: add raw_prompt_str to gen_batch (sicer)
-                gen_batch.non_tensor_batch['raw_prompt_str'] = batch.non_tensor_batch['raw_prompt_str']
-                gen_batch.non_tensor_batch['data_source'] = batch.non_tensor_batch['data_source']
+                # NOTE: add raw_prompt_str to gen_batch
+                # gen_batch = gen_batch.union(batch.select(non_tensor_batch_keys=['raw_prompt_str', "data_source"]))
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
