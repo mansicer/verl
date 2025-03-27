@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # from . import gsm8k, math, prime_math, prime_code
+from verl.utils.reward_score.math_verify import math_verify_reward, qwen_math_reward
+from verl.utils.reward_score.math_verify import train_verification_reward, test_verification_reward
+from verl.utils.reward_score.logic_rl import *
 
 
-def _default_compute_score(data_source, solution_str, ground_truth, extra_info=None):
+def _default_compute_score(data_source, solution_str, ground_truth, extra_info):
+    # get the final response
+    if "</think>" in solution_str:
+        solution_str = solution_str.split("</think>")[-1]
+
     if data_source == 'openai/gsm8k':
         from . import gsm8k
         res = gsm8k.compute_score(solution_str, ground_truth)
@@ -41,8 +48,30 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
     elif data_source in ['hiyouga/geometry3k']:
         from . import geo3k
         res = geo3k.compute_score(solution_str, ground_truth)
+
+    elif data_source.startswith("math-verify"):
+        res = math_verify_reward(data_source, solution_str, ground_truth, extra_info)
+
+    elif data_source.endswith("verification"):
+        if data_source.startswith("test"):
+            res = test_verification_reward(data_source, solution_str, ground_truth, extra_info)
+        else:
+            res = train_verification_reward(data_source, solution_str, ground_truth, extra_info)
+
+    elif data_source == "qwen-math":
+        res = qwen_math_reward(data_source, solution_str, ground_truth, extra_info)
+
+    elif data_source.startswith("point24"):
+        res = compute_point24_score(solution_str, ground_truth, extra_info)
+    elif data_source.startswith("minsum"):
+        res = compute_minsum_score(solution_str, ground_truth, extra_info)
+    elif data_source.startswith("sudoku"):
+        res = compute_sudoku_score(solution_str, ground_truth, extra_info)
+    elif data_source.startswith("kk"):
+        res = compute_kk_score(solution_str, ground_truth, extra_info)
+
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Reward score for {data_source} is not implemented")
 
     if isinstance(res, (int, float, bool)):
         return float(res)

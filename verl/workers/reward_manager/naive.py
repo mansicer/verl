@@ -46,11 +46,12 @@ class NaiveRewardManager:
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
 
-            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
-
             data_source = data_item.non_tensor_batch['data_source']
+            ground_truth = extra_info['ground_truth']
 
-            extra_info = data_item.non_tensor_batch.get('extra_info', None)
+            extra_info = data_item.non_tensor_batch.get('extra_info', dict())
+            extra_info.update(data_item.non_tensor_batch['reward_model'])
+            print("naive reward manager extra_info: ", extra_info)
 
             score = self.compute_score(
                 data_source=data_source,
@@ -95,7 +96,8 @@ class NaiveRewardManager:
 
             data_source = data_item.non_tensor_batch['data_source']
 
-            extra_info = data_item.non_tensor_batch.get('extra_info', None)
+            extra_info = data_item.non_tensor_batch.get('extra_info', dict())
+            extra_info.update(data_item.non_tensor_batch['reward_model'])
 
             score = self.compute_score(
                 data_source=data_source,

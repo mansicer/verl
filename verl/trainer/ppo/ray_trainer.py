@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 import ray
 import numpy as np
+import wandb
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
@@ -459,8 +460,8 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
-        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
+    def _maybe_log_val_generations_to_wandb(self, inputs, outputs, scores, data_sources=None):
+        """Log a table of validation samples to wandb, grouped by data source"""
 
         generations_to_log = self.config.trainer.val_generations_to_log_to_wandb
 
@@ -469,19 +470,55 @@ class RayPPOTrainer(object):
 
         import numpy as np
 
-        # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
+        # Create tuples of (input, output, score, data_source) and sort by input text
+        data_sources = data_sources if data_sources else ['unknown'] * len(inputs)
+        samples = list(zip(inputs, outputs, scores, data_sources))
 
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
+        # Create a dictionary to store samples by data source
+        data_source_samples = {}
+        for sample in samples:
+            data_source = sample[3]  # The data source is the 4th element
+            if data_source not in data_source_samples:
+                data_source_samples[data_source] = []
+            data_source_samples[data_source].append(sample)
 
-        # Take first N samples after shuffling
-        samples = samples[:generations_to_log]
+        # Log each data source separately
+        for data_source, source_samples in data_source_samples.items():
+            # Sort samples by input text
+            source_samples.sort(key=lambda x: x[0])
 
-        # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+            # Use fixed random seed for deterministic shuffling
+            rng = np.random.RandomState(42)
+            rng.shuffle(source_samples)
+
+            # Take first N samples after shuffling
+            source_samples = source_samples[:generations_to_log]
+
+            # Create column names for all samples
+            columns = ["step"] + sum(
+                [[f"input_{i+1}", f"output_{i+1}", f"score_{i+1}"] for i in range(len(source_samples))], [])
+
+            table_attr_name = f'validation_table_{data_source}'
+            if not hasattr(self, table_attr_name):
+                # Initialize the table on first call
+                setattr(self, table_attr_name, wandb.Table(columns=columns))
+
+            # Create a new table with same columns and existing data
+            existing_table = getattr(self, table_attr_name)
+            new_table = wandb.Table(columns=columns, data=existing_table.data)
+
+            # Add new row with all data
+            row_data = []
+            row_data.append(self.global_steps)
+            for sample in source_samples:
+                # Only include the first 3 elements (input, output, score)
+                row_data.extend(sample[:3])
+
+            new_table.add_data(*row_data)
+
+            # Update reference and log
+            wandb.log({f"val/generations/{data_source}": new_table}, step=self.global_steps)
+            setattr(self, table_attr_name, new_table)
 
     def _validate(self):
         reward_tensor_lst = []
@@ -550,10 +587,17 @@ class RayPPOTrainer(object):
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
-            reward_tensor_lst.append(reward_tensor)
+            # Get data sources
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+            reward_tensor_lst.append(reward_tensor)
+
+        # Flatten data_source_lst for the generations logging
+        flattened_data_sources = [src for batch_sources in data_source_lst for src in batch_sources]
+        self._maybe_log_val_generations_to_wandb(inputs=sample_inputs,
+                                                 outputs=sample_outputs,
+                                                 scores=sample_scores,
+                                                 data_sources=flattened_data_sources)
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
