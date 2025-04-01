@@ -15,10 +15,18 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.verifier_trainer import VerifierTrainer
+from verl.utils.trainer_info import Role, AdvantageEstimator, ResourcePoolManager
 
 import os
 import ray
 import hydra
+
+
+TRAINER_REGISTRY = {
+    "ray": RayPPOTrainer,
+    "verifier": VerifierTrainer,
+}
 
 
 def get_custom_reward_fn(config):
@@ -107,8 +115,6 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
-
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
             Role.Critic: ray.remote(CriticWorker),
@@ -158,18 +164,19 @@ class TaskRunner:
         reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
 
         # Note that we always use function-based RM for validation
-        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
+        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        trainer = RayPPOTrainer(config=config,
-                                tokenizer=tokenizer,
-                                processor=processor,
-                                role_worker_mapping=role_worker_mapping,
-                                resource_pool_manager=resource_pool_manager,
-                                ray_worker_group_cls=ray_worker_group_cls,
-                                reward_fn=reward_fn,
-                                val_reward_fn=val_reward_fn)
+        trainer_cls = TRAINER_REGISTRY[config.trainer.name]
+        trainer = trainer_cls(config=config,
+                            tokenizer=tokenizer,
+                            processor=processor,
+                            role_worker_mapping=role_worker_mapping,
+                            resource_pool_manager=resource_pool_manager,
+                            ray_worker_group_cls=ray_worker_group_cls,
+                            reward_fn=reward_fn,
+                            val_reward_fn=val_reward_fn)
         trainer.init_workers()
         trainer.fit()
 

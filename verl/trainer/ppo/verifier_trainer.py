@@ -42,8 +42,8 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.tracking import ValidationGenerationsLogger
-from torch.utils.data import RandomSampler, SequentialSampler
 from verl.utils.trainer_info import Role, AdvantageEstimator, ResourcePoolManager
+from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 WorkerType = Type[Worker]
@@ -67,6 +67,65 @@ def dataprotoitem_to_dataproto(item: DataProtoItem) -> DataProto:
     )
 
 
+@dataclass
+class ResourcePoolManager:
+    """
+    Define a resource pool specification. Resource pool will be initialized first.
+    Mapping
+    """
+    resource_pool_spec: dict[str, list[int]]
+    mapping: dict[Role, str]
+    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+
+    def create_resource_pool(self):
+        for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
+            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
+            # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
+            # For Megatron backend, we recommend using max_colocate_count>1 that can utilize different WorkerGroup for differnt models
+            resource_pool = RayResourcePool(process_on_nodes=process_on_nodes,
+                                            use_gpu=True,
+                                            max_colocate_count=1,
+                                            name_prefix=resource_pool_name)
+            self.resource_pool_dict[resource_pool_name] = resource_pool
+
+        self._check_resource_available()
+
+    def get_resource_pool(self, role: Role) -> RayResourcePool:
+        """Get the resource pool of the worker_cls"""
+        return self.resource_pool_dict[self.mapping[role]]
+
+    def get_n_gpus(self) -> int:
+        """Get the number of gpus in this cluster."""
+        return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
+
+    def _check_resource_available(self):
+        """Check if the resource pool can be satisfied in this ray cluster."""
+        node_available_resources = ray.state.available_resources_per_node()
+        node_available_gpus = {node: node_info.get('GPU', 0) for node, node_info in node_available_resources.items()}
+
+        # check total required gpus can be satisfied
+        total_available_gpus = sum(node_available_gpus.values())
+        total_required_gpus = sum(
+            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
+        if total_available_gpus < total_required_gpus:
+            raise ValueError(
+                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}")
+
+        # check each resource pool can be satisfied, O(#resource_pools * #nodes)
+        for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
+            num_gpus, num_nodes = process_on_nodes[0], len(process_on_nodes)
+            for node, available_gpus in node_available_gpus.items():
+                if available_gpus >= num_gpus:
+                    node_available_gpus[node] -= num_gpus
+                    num_nodes -= 1
+                    if num_nodes == 0:
+                        break
+            if num_nodes > 0:
+                raise ValueError(
+                    f"Resource pool {resource_pool_name}: {num_gpus}*{num_nodes} cannot be satisfied in this ray cluster"
+                )
+
+
 import torch
 from verl.utils.torch_functional import masked_mean
 
@@ -80,11 +139,14 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     response_mask = attention_mask[:, -response_length:]
 
     # compute kl between ref_policy and current policy
-    # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
-    kld = core_algos.kl_penalty(data.batch['old_log_probs'], data.batch['ref_log_prob'],
-                                kl_penalty=kl_penalty)  # (batch_size, response_length)
-    kld = kld * response_mask
-    beta = kl_ctrl.value
+    if 'ref_log_prob' in data.batch.keys():
+        kld = core_algos.kl_penalty(data.batch['old_log_probs'], data.batch['ref_log_prob'],
+                                    kl_penalty=kl_penalty)  # (batch_size, response_length)
+        kld = kld * response_mask
+        beta = kl_ctrl.value
+    else:
+        beta = 0
+        kld = torch.zeros_like(response_mask, dtype=torch.float32)
 
     token_level_rewards = token_level_scores - beta * kld
 
@@ -95,7 +157,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
     data.batch['token_level_rewards'] = token_level_rewards
 
-    metrics = {'actor/reward_kl_penalty': current_kl, 'actor/reward_kl_penalty_coeff': beta}
+    metrics = {'critic/kl': current_kl, 'critic/kl_coeff': beta}
 
     return data, metrics
 
@@ -162,7 +224,7 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     timing_raw[name] = timer.last
 
 
-class RayPPOTrainer(object):
+class VerifierTrainer(object):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
@@ -200,10 +262,19 @@ class RayPPOTrainer(object):
         self.ray_worker_group_cls = ray_worker_group_cls
         self.validation_generations_logger = ValidationGenerationsLogger()
 
-        # define in-reward KL control
-        # kl loss control currently not suppoorted
-        if config.algorithm.use_kl_in_reward:
-            self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
+        # define KL control
+        if self.use_reference_policy:
+            if config.algorithm.kl_ctrl.type == 'fixed':
+                self.kl_ctrl = core_algos.FixedKLController(kl_coef=config.algorithm.kl_ctrl.kl_coef)
+            elif config.algorithm.kl_ctrl.type == 'adaptive':
+                assert config.algorithm.kl_ctrl.horizon > 0, f'horizon must be larger than 0. Got {config.critic.kl_ctrl.horizon}'
+                self.kl_ctrl = core_algos.AdaptiveKLController(init_kl_coef=config.algorithm.kl_ctrl.kl_coef,
+                                                               target_kl=config.algorithm.kl_ctrl.target_kl,
+                                                               horizon=config.algorithm.kl_ctrl.horizon)
+            else:
+                raise NotImplementedError
+        else:
+            self.kl_ctrl = core_algos.FixedKLController(kl_coef=0.)
 
         if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
@@ -214,6 +285,9 @@ class RayPPOTrainer(object):
             self.use_critic = False
         else:
             raise NotImplementedError
+        
+        # verifier data path
+        self.verification_data_path = os.path.join(self.config.trainer.default_local_dir, "verification_data.parquet")
 
         self._validate_config()
         self._create_dataloader()
@@ -231,27 +305,14 @@ class RayPPOTrainer(object):
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
         # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
         def check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
-            settings = {
-                "actor_rollout_ref.actor": "micro_batch_size",
-                "critic": "micro_batch_size",
-                "reward_model": "micro_batch_size",
-                "actor_rollout_ref.ref": "log_prob_micro_batch_size",
-                "actor_rollout_ref.rollout": "log_prob_micro_batch_size",
-            }
+            if mbs is None and mbs_per_gpu is None:
+                raise ValueError(f"[{name}] Please set at least one of '{name}.micro_batch_size' or "
+                                 f"'{name}.micro_batch_size_per_gpu'.")
 
-            if name in settings:
-                param = settings[name]
-                param_per_gpu = f"{param}_per_gpu"
-
-                if mbs is None and mbs_per_gpu is None:
-                    raise ValueError(
-                        f"[{name}] Please set at least one of '{name}.{param}' or '{name}.{param_per_gpu}'.")
-
-                if mbs is not None and mbs_per_gpu is not None:
-                    raise ValueError(
-                        f"[{name}] You have set both '{name}.{param}' AND '{name}.{param_per_gpu}'. "
-                        f"Please remove '{name}.{param}' because only '*_{param_per_gpu}' is supported (the former is deprecated)."
-                    )
+            if mbs is not None and mbs_per_gpu is not None:
+                raise ValueError(f"[{name}] You have set both '{name}.micro_batch_size' AND "
+                                 f"'{name}.micro_batch_size_per_gpu'. Please remove '{name}.micro_batch_size' "
+                                 f"because only '*_micro_batch_size_per_gpu' is supported (the former is deprecated).")
 
         if not config.actor_rollout_ref.actor.use_dynamic_bsz:
             # actor: ppo_micro_batch_size vs. ppo_micro_batch_size_per_gpu
@@ -259,11 +320,10 @@ class RayPPOTrainer(object):
                                      config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu,
                                      "actor_rollout_ref.actor")
 
-            if self.use_reference_policy:
-                # reference: log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu
-                check_mutually_exclusive(config.actor_rollout_ref.ref.log_prob_micro_batch_size,
-                                         config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu,
-                                         "actor_rollout_ref.ref")
+            # reference: log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu
+            check_mutually_exclusive(config.actor_rollout_ref.ref.log_prob_micro_batch_size,
+                                     config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu,
+                                     "actor_rollout_ref.ref")
 
             #  The rollout section also has log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu
             check_mutually_exclusive(config.actor_rollout_ref.rollout.log_prob_micro_batch_size,
@@ -291,9 +351,6 @@ class RayPPOTrainer(object):
             if config.actor_rollout_ref.actor.ppo_micro_batch_size is not None:
                 assert config.actor_rollout_ref.actor.ppo_mini_batch_size % config.actor_rollout_ref.actor.ppo_micro_batch_size == 0
                 assert config.actor_rollout_ref.actor.ppo_micro_batch_size * sp_size >= n_gpus
-
-        if config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
-            print(f"NOTICE: You have both enabled in-reward kl and kl loss.")
 
         # critic
         if self.use_critic and not config.critic.use_dynamic_bsz:
@@ -339,6 +396,10 @@ class RayPPOTrainer(object):
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
                                          truncation=self.config.data.get('truncation', 'error'),
                                          filter_overlong_prompts=self.config.data.filter_overlong_prompts)
+        if self.config.trainer.save_online_data.enabled:
+            self.online_data_size = int(len(self.train_dataset) * self.config.trainer.save_online_data.train_data_save_ratio)
+            print(f"Online data saved size: {self.online_data_size}")
+
         assert self.train_dataset.truncation == self.config.data.get(
             'truncation', 'error'
         ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
@@ -404,7 +465,7 @@ class RayPPOTrainer(object):
     def _maybe_log_val_generations_to_wandb(self, inputs, outputs, scores, data_sources=None):
         """Log a table of validation samples to wandb, grouped by data source"""
 
-        generations_to_log = self.config.trainer.log_val_generations
+        generations_to_log = self.config.trainer.val_generations_to_log_to_wandb
 
         if generations_to_log == 0:
             return
@@ -690,10 +751,10 @@ class RayPPOTrainer(object):
                 print('Training from scratch')
                 return 0
         else:
-            if self.config.trainer.resume_mode == "resume_path":
-                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-                assert 'global_step_' in self.config.trainer.resume_from_path, "resume ckpt must specify the global_steps"
-                global_step_folder = self.config.trainer.resume_from_path
+            if not (self.config.trainer.resume_from_path and global_step_folder is not None):
+                assert isinstance(self.config.trainer.resume_mode, str), "resume ckpt must be str type"
+                assert 'global_step_' in self.config.trainer.resume_mode, "resume ckpt must specify the global_steps"
+                global_step_folder = self.config.trainer.resume_mode
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
@@ -740,6 +801,139 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _process_online_data(self, batch: DataProto):
+        data_sources = batch.non_tensor_batch['data_source']
+        raw_problem = batch.non_tensor_batch['raw_problem']
+        output_ids = batch.batch['responses']
+        output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+        rewards = batch.batch['token_level_scores']
+
+        count = 0
+        for data_source, problem, response, reward in zip(data_sources, raw_problem, output_texts, rewards):
+            if data_source not in self.config.trainer.save_online_data.data_sources_to_save:
+                continue
+            score = reward.sum(-1).bool().item()
+            if score == 1.0 or score == 0.0:
+                self.online_saved_data.append(dict(problem=problem, response=response, score=score))
+                count += 1
+        print(f"Add {count} valid samples to online dataset")
+
+    def _record_online_data(self, current_epoch):
+        import datasets
+        dataset = datasets.Dataset.from_list(self.online_saved_data)
+        
+        data_source = self.config.trainer.save_online_data.data_source
+        split = "train"
+
+        def build_verification_messages(question, response):
+            messages = [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": response},
+                {"role": "user", "content": f'Please verify the solution step by step. At the end of the solution verification, when you give your final grade, write it in the form "Is the answer correct (Yes/No)? X", where X is either Yes or No.'},
+            ]
+            return messages
+
+        def process_fn(example, idx):
+            question = example.pop("problem")
+            response = example.pop("response")
+            if "</think>" in response:
+                response = response.split("</think>")[1]
+            messages = build_verification_messages(question, response)
+            answer = example.pop("score")
+
+            data = {
+                "data_source": data_source,
+                "prompt": messages,
+                "ability": "math",
+                "reward_model": {
+                    "style": "rule",
+                    "ground_truth": answer,
+                },
+                "extra_info": {"split": split, "index": idx},
+            }
+            return data
+        dataset = dataset.map(process_fn, with_indices=True)
+        train_test = dataset.train_test_split(test_size=self.config.trainer.save_online_data.val_data_size)
+        train_dataset = train_test['train']
+        test_dataset = train_test['test']
+        train_dataset = train_dataset.shuffle().select(range(self.online_data_size))
+        train_path = os.path.join(self.config.trainer.save_online_data.path, f"train-epoch-{current_epoch}.parquet")
+        test_path = os.path.join(self.config.trainer.save_online_data.path, f"val-epoch-{current_epoch}.parquet")
+        train_dataset.to_parquet(train_path)
+        test_dataset.to_parquet(test_path)
+        train_dataset.to_parquet(os.path.join(self.config.trainer.save_online_data.path, "train-latest.parquet"))
+        test_dataset.to_parquet(os.path.join(self.config.trainer.save_online_data.path, "val-latest.parquet"))
+        print(f"Online data saved to {train_path} and {test_path}")
+    
+    def _reset_dataloader(self):
+        if isinstance(self.config.data.train_files, str):
+            train_files = [self.config.data.train_files, os.path.join(self.config.trainer.save_online_data.path, "train-latest.parquet")]
+        else:
+            train_files = self.config.data.train_files + [os.path.join(self.config.trainer.save_online_data.path, "train-latest.parquet")]
+        if isinstance(self.config.data.val_files, str):
+            val_files = [self.config.data.val_files, os.path.join(self.config.trainer.save_online_data.path, "val-latest.parquet")]
+        else:
+            val_files = self.config.data.val_files + [os.path.join(self.config.trainer.save_online_data.path, "val-latest.parquet")]
+
+        self.train_dataset = RLHFDataset(parquet_files=train_files,
+                                         tokenizer=self.tokenizer,
+                                         processor=self.processor,
+                                         prompt_key=self.config.data.prompt_key,
+                                         image_key=self.config.data.get('image_key', 'images'),
+                                         max_prompt_length=self.config.data.max_prompt_length,
+                                         filter_prompts=True,
+                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                         truncation=self.config.data.get('truncation', 'error'),
+                                         filter_overlong_prompts=self.config.data.filter_overlong_prompts)
+        assert self.train_dataset.truncation == self.config.data.get(
+            'truncation', 'error'
+        ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
+        # use sampler for better ckpt resume
+        if self.config.data.shuffle:
+            train_dataloader_generator = torch.Generator()
+            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
+            sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
+        else:
+            sampler = SequentialSampler(data_source=self.train_dataset)
+
+        self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
+                                                   batch_size=self.config.data.train_batch_size,
+                                                   num_workers=8,
+                                                   drop_last=True,
+                                                   collate_fn=collate_fn,
+                                                   sampler=sampler)
+
+        self.val_dataset = RLHFDataset(parquet_files=val_files,
+                                       tokenizer=self.tokenizer,
+                                       processor=self.processor,
+                                       prompt_key=self.config.data.prompt_key,
+                                       image_key=self.config.data.get('image_key', 'images'),
+                                       max_prompt_length=self.config.data.max_prompt_length,
+                                       filter_prompts=True,
+                                       return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                       truncation=self.config.data.get('truncation', 'error'),
+                                       filter_overlong_prompts=self.config.data.filter_overlong_prompts)
+        assert self.val_dataset.truncation == self.config.data.get(
+            'truncation', 'error'
+        ), f'dataset truncation {self.val_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            # Validation datasets are sent to inference engines as a whole batch,
+            # which will schedule the memory themselves.
+            batch_size=len(self.val_dataset),
+            num_workers=8,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collate_fn)
+
+        assert len(self.train_dataloader) >= 1
+        assert len(
+            self.val_dataloader
+        ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
+
+        print(f'Size of train dataloader: {len(self.train_dataloader)}')
+
+
     def fit(self):
         """
         The training loop of PPO.
@@ -761,7 +955,7 @@ class RayPPOTrainer(object):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', False):
             val_metrics = self._validate()
             pprint(f'Initial validation metrics: {val_metrics}')
             logger.log(data=val_metrics, step=self.global_steps)
@@ -776,6 +970,9 @@ class RayPPOTrainer(object):
         last_val_metrics = None
 
         for epoch in range(self.config.trainer.total_epochs):
+            if self.config.trainer.save_online_data.enabled:
+                self.online_saved_data = []
+
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -882,7 +1079,7 @@ class RayPPOTrainer(object):
                             # Log to metrics
                             for reward, count in reward_dict.items():
                                 metrics[f"batch/reward_{reward}_ratio"] = count / len(unique_uids)
-                            metrics["batch/valid_ratio"] = torch.sum(valid_mask).item() / valid_mask.shape[0]
+                            metrics["batch/valid_ratio"] = torch.sum(valid_mask).item() / len(unique_uids)
 
                             if self.config.trainer.rejection_sample:
                                 # If no valid samples remain, skip this batch and get a new one
@@ -906,10 +1103,14 @@ class RayPPOTrainer(object):
                                 batch = batch[size_mask]
                                 batch = dataprotoitem_to_dataproto(batch)
 
+                        # save data if collect online data
+                        if self.config.trainer.save_online_data.enabled:
+                            self._process_online_data(batch)
+
                         # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
+                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
                             batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl_in_reward,
+                                                                 kl_ctrl=self.kl_ctrl,
                                                                  kl_penalty=self.config.algorithm.kl_penalty)
                             metrics.update(kl_metrics)
                         else:
@@ -968,3 +1169,9 @@ class RayPPOTrainer(object):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+
+            if self.config.trainer.save_online_data.enabled:
+                print(f"Saving online data")
+                self._record_online_data(current_epoch=epoch)
+                print(f"Resetting dataloader")
+                self._reset_dataloader()
