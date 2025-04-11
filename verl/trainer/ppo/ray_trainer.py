@@ -27,14 +27,16 @@ from typing import Type, Dict
 from copy import deepcopy
 from collections import defaultdict
 from functools import partial
+from modal import Retries
 from tqdm import tqdm
 
 import ray
 import numpy as np
+import wandb
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoItem
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -73,6 +75,22 @@ class AdvantageEstimator(str, Enum):
     REINFORCE_PLUS_PLUS_BASELINE = 'reinforce_plus_plus_baseline'
     REMAX = 'remax'
     RLOO = 'rloo'
+
+
+def dataprotoitem_to_dataproto(item: DataProtoItem) -> DataProto:
+    """Convert a DataProtoItem to a DataProto object"""
+    return DataProto.from_dict(
+        tensors=item.batch,  # TensorDict is already in correct format
+        non_tensors=item.non_tensor_batch,  # Dict is already in correct format 
+        meta_info=item.meta_info)
+
+
+def dataprotoitem_to_dataproto(item: DataProtoItem) -> DataProto:
+    """Convert a DataProtoItem to a DataProto object"""
+    return DataProto.from_dict(
+        tensors=item.batch,  # TensorDict is already in correct format
+        non_tensors=item.non_tensor_batch,  # Dict is already in correct format 
+        meta_info=item.meta_info)
 
 
 @dataclass
@@ -291,6 +309,9 @@ class RayPPOTrainer(object):
         else:
             raise NotImplementedError
 
+        # verifier data path
+        self.verification_data_path = os.path.join(self.config.trainer.default_local_dir, "verification_data.parquet")
+
         self._validate_config()
         self._create_dataloader()
 
@@ -424,7 +445,14 @@ class RayPPOTrainer(object):
             processor=self.processor,
             config=self.config.data,
         )
+        if self.config.trainer.save_online_data.enabled:
+            self.online_data_size = int(
+                len(self.train_dataset) * self.config.trainer.save_online_data.train_data_save_ratio)
+            print(f"Online data saved size: {self.online_data_size}")
 
+        assert self.train_dataset.truncation == self.config.data.get(
+            'truncation', 'error'
+        ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
         # use sampler for better ckpt resume
         if self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
@@ -478,8 +506,8 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
-        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
+    def _maybe_log_val_generations_to_wandb(self, inputs, outputs, scores, data_sources=None):
+        """Log a table of validation samples to wandb, grouped by data source"""
 
         generations_to_log = self.config.trainer.log_val_generations
 
@@ -488,19 +516,55 @@ class RayPPOTrainer(object):
 
         import numpy as np
 
-        # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
+        # Create tuples of (input, output, score, data_source) and sort by input text
+        data_sources = data_sources if data_sources else ['unknown'] * len(inputs)
+        samples = list(zip(inputs, outputs, scores, data_sources))
 
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
+        # Create a dictionary to store samples by data source
+        data_source_samples = {}
+        for sample in samples:
+            data_source = sample[3]  # The data source is the 4th element
+            if data_source not in data_source_samples:
+                data_source_samples[data_source] = []
+            data_source_samples[data_source].append(sample)
 
-        # Take first N samples after shuffling
-        samples = samples[:generations_to_log]
+        # Log each data source separately
+        for data_source, source_samples in data_source_samples.items():
+            # Sort samples by input text
+            source_samples.sort(key=lambda x: x[0])
 
-        # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+            # Use fixed random seed for deterministic shuffling
+            rng = np.random.RandomState(42)
+            rng.shuffle(source_samples)
+
+            # Take first N samples after shuffling
+            source_samples = source_samples[:generations_to_log]
+
+            # Create column names for all samples
+            columns = ["step"] + sum(
+                [[f"input_{i+1}", f"output_{i+1}", f"score_{i+1}"] for i in range(len(source_samples))], [])
+
+            table_attr_name = f'validation_table_{data_source}'
+            if not hasattr(self, table_attr_name):
+                # Initialize the table on first call
+                setattr(self, table_attr_name, wandb.Table(columns=columns))
+
+            # Create a new table with same columns and existing data
+            existing_table = getattr(self, table_attr_name)
+            new_table = wandb.Table(columns=columns, data=existing_table.data)
+
+            # Add new row with all data
+            row_data = []
+            row_data.append(self.global_steps)
+            for sample in source_samples:
+                # Only include the first 3 elements (input, output, score)
+                row_data.extend(sample[:3])
+
+            new_table.add_data(*row_data)
+
+            # Update reference and log
+            wandb.log({f"val/generations/{data_source}": new_table}, step=self.global_steps)
+            setattr(self, table_attr_name, new_table)
 
     def _validate(self):
         data_source_lst = []
@@ -574,9 +638,15 @@ class RayPPOTrainer(object):
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
 
+            # Get data sources
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        # Flatten data_source_lst for the generations logging
+        flattened_data_sources = [src for batch_sources in data_source_lst for src in batch_sources]
+        self._maybe_log_val_generations_to_wandb(inputs=sample_inputs,
+                                                 outputs=sample_outputs,
+                                                 scores=sample_scores,
+                                                 data_sources=flattened_data_sources)
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
@@ -790,6 +860,161 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _process_online_data(self, batch: DataProto):
+        data_sources = batch.non_tensor_batch['data_source']
+        raw_problem = batch.non_tensor_batch['raw_problem']
+        output_ids = batch.batch['responses']
+        output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+        rewards = batch.batch['token_level_scores']
+
+        count = 0
+        for data_source, problem, response, reward in zip(data_sources, raw_problem, output_texts, rewards):
+            if data_source not in self.config.trainer.save_online_data.data_sources_to_save:
+                continue
+            score = reward.sum(-1).bool().item()
+            if score == 1.0 or score == 0.0:
+                self.online_saved_data.append(dict(problem=problem, response=response, score=score))
+                count += 1
+        print(f"Add {count} valid samples to online dataset")
+
+    def _record_online_data(self, current_epoch):
+        import datasets
+        dataset = datasets.Dataset.from_list(self.online_saved_data)
+
+        data_source = self.config.trainer.save_online_data.data_source
+        split = "train"
+
+        def build_verification_messages(question, response):
+            messages = [
+                {
+                    "role": "user",
+                    "content": question
+                },
+                {
+                    "role": "assistant",
+                    "content": response
+                },
+                {
+                    "role":
+                        "user",
+                    "content":
+                        f'Please verify the solution step by step. At the end of the solution verification, when you give your final grade, write it in the form "Is the answer correct (Yes/No)? X", where X is either Yes or No.'
+                },
+            ]
+            return messages
+
+        def process_fn(example, idx):
+            question = example.pop("problem")
+            response = example.pop("response")
+            if "</think>" in response:
+                response = response.split("</think>")[1]
+            messages = build_verification_messages(question, response)
+            answer = example.pop("score")
+
+            data = {
+                "data_source": data_source,
+                "prompt": messages,
+                "ability": "math",
+                "reward_model": {
+                    "style": "rule",
+                    "ground_truth": answer,
+                },
+                "extra_info": {
+                    "split": split,
+                    "index": idx
+                },
+            }
+            return data
+
+        dataset = dataset.map(process_fn, with_indices=True)
+        train_test = dataset.train_test_split(test_size=self.config.trainer.save_online_data.val_data_size)
+        train_dataset = train_test['train']
+        test_dataset = train_test['test']
+        train_dataset = train_dataset.shuffle().select(range(self.online_data_size))
+        train_path = os.path.join(self.config.trainer.save_online_data.path, f"train-epoch-{current_epoch}.parquet")
+        test_path = os.path.join(self.config.trainer.save_online_data.path, f"val-epoch-{current_epoch}.parquet")
+        train_dataset.to_parquet(train_path)
+        test_dataset.to_parquet(test_path)
+        train_dataset.to_parquet(os.path.join(self.config.trainer.save_online_data.path, "train-latest.parquet"))
+        test_dataset.to_parquet(os.path.join(self.config.trainer.save_online_data.path, "val-latest.parquet"))
+        print(f"Online data saved to {train_path} and {test_path}")
+
+    def _reset_dataloader(self):
+        if isinstance(self.config.data.train_files, str):
+            train_files = [
+                self.config.data.train_files,
+                os.path.join(self.config.trainer.save_online_data.path, "train-latest.parquet")
+            ]
+        else:
+            train_files = self.config.data.train_files + [
+                os.path.join(self.config.trainer.save_online_data.path, "train-latest.parquet")
+            ]
+        if isinstance(self.config.data.val_files, str):
+            val_files = [
+                self.config.data.val_files,
+                os.path.join(self.config.trainer.save_online_data.path, "val-latest.parquet")
+            ]
+        else:
+            val_files = self.config.data.val_files + [
+                os.path.join(self.config.trainer.save_online_data.path, "val-latest.parquet")
+            ]
+
+        from verl.utils.import_utils import load_extern_type
+        if "custom_cls" in self.config.data and self.config.data.custom_cls.get("path", None) is not None:
+            dataset_cls = load_extern_type(self.config.data.custom_cls.path, self.config.data.custom_cls.name)
+            if not issubclass(dataset_cls, Dataset):
+                raise TypeError(f"The custom dataset class '{self.config.data.custom_cls.name}' from "
+                                f"'{self.config.data.custom_cls.path}' must inherit from torch.utils.data.Dataset")
+        else:
+            dataset_cls = RLHFDataset
+
+        self.train_dataset = dataset_cls(
+            data_files=self.config.data.train_files,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            config=self.config.data,
+        )
+        assert self.train_dataset.truncation == self.config.data.get(
+            'truncation', 'error'
+        ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
+        # use sampler for better ckpt resume
+        if self.config.data.shuffle:
+            train_dataloader_generator = torch.Generator()
+            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
+            sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
+        else:
+            sampler = SequentialSampler(data_source=self.train_dataset)
+
+        self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
+                                                   batch_size=self.config.data.train_batch_size,
+                                                   num_workers=8,
+                                                   drop_last=True,
+                                                   collate_fn=collate_fn,
+                                                   sampler=sampler)
+
+        self.val_dataset = dataset_cls(
+            data_files=self.config.data.val_files,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            config=self.config.data,
+        )
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            # Validation datasets are sent to inference engines as a whole batch,
+            # which will schedule the memory themselves.
+            batch_size=len(self.val_dataset),
+            num_workers=8,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collate_fn)
+
+        assert len(self.train_dataloader) >= 1
+        assert len(
+            self.val_dataloader
+        ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
+
+        print(f'Size of train dataloader: {len(self.train_dataloader)}')
+
     def fit(self):
         """
         The training loop of PPO.
@@ -826,6 +1051,9 @@ class RayPPOTrainer(object):
         last_val_metrics = None
 
         for epoch in range(self.config.trainer.total_epochs):
+            if self.config.trainer.save_online_data.enabled:
+                self.online_saved_data = []
+
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -926,6 +1154,56 @@ class RayPPOTrainer(object):
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                        # NOTE: adapt from deepscaler https://github.com/agentica-project/deepscaler/blob/main/verl/verl/trainer/ppo/ray_trainer.py#L627
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO:
+                            # Rejection sampling based on rewards
+                            # Group rewards by uid
+                            uids = batch.non_tensor_batch['uid']
+                            unique_uids = np.unique(uids)
+                            valid_mask = torch.ones(len(uids), dtype=torch.bool)
+                            reward_dict = {}
+                            for uid in unique_uids:
+                                uid_mask = uids == uid
+                                uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
+                                unique_rewards = np.unique(uid_rewards)
+                                if len(unique_rewards) == 1:
+                                    valid_mask[uid_mask] = False
+                                    reward_dict[unique_rewards[0]] = reward_dict.get(unique_rewards[0], 0) + 1
+
+                            # Log to metrics
+                            for reward, count in reward_dict.items():
+                                Retries[f"batch/reward_{reward}_ratio"] = count / len(unique_uids)
+                            metrics["batch/valid_ratio"] = torch.sum(valid_mask).item() / len(unique_uids)
+
+                            if self.config.trainer.rejection_sample:
+                                # If no valid samples remain, skip this batch and get a new one
+                                if not valid_mask.any():
+                                    print(f"no valid sample, just continue: {reward_dict=}")
+                                    continue
+
+                                # Filter batch to keep only valid samples
+                                print(
+                                    f"before rejection sampling batch size: {batch.batch['input_ids'].shape[0]}, after rejection sampling batch size: {torch.sum(valid_mask).item()}"
+                                )
+                                batch = batch[valid_mask]
+                                batch = dataprotoitem_to_dataproto(batch)
+                                # Round down to the nearest multiple of world size
+                                num_trainer_replicas = self.actor_rollout_wg.world_size
+                                max_batch_size = (batch.batch['input_ids'].shape[0] //
+                                                  num_trainer_replicas) * num_trainer_replicas
+                                if not max_batch_size:
+                                    # give up, you got everything either all wrong or right.
+                                    print(f"max_batch_size is: {max_batch_size}, just continue")
+                                    continue
+                                size_mask = torch.zeros(batch.batch['input_ids'].shape[0], dtype=torch.bool)
+                                size_mask[:max_batch_size] = True
+                                batch = batch[size_mask]
+                                batch = dataprotoitem_to_dataproto(batch)
+
+                        # save data if collect online data
+                        if self.config.trainer.save_online_data.enabled:
+                            self._process_online_data(batch)
+
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(batch,
@@ -988,3 +1266,9 @@ class RayPPOTrainer(object):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+
+            if self.config.trainer.save_online_data.enabled:
+                print(f"Saving online data")
+                self._record_online_data(current_epoch=epoch)
+                print(f"Resetting dataloader")
+                self._reset_dataloader()

@@ -209,6 +209,14 @@ class RLHFDataset(Dataset):
         row_dict['attention_mask'] = attention_mask[0]
         row_dict['position_ids'] = position_ids[0]
         row_dict['raw_prompt_ids'] = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        row_dict['data_source'] = row_dict.get('data_source', 'unknown')
+        row_dict["raw_prompt_str"] = prompt_with_chat_template
+        # Extract the last user message from the chat
+        user_messages = [msg for msg in chat if msg['role'] == 'user']
+        if user_messages:
+            row_dict["raw_problem"] = user_messages[-1]['content']
+        else:
+            row_dict["raw_problem"] = ""
 
         # encode prompts without chat template
         if self.return_raw_chat:
