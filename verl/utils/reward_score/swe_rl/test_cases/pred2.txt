@@ -1,0 +1,32 @@
+<patch>
+--- a/astropy/table/table.py
++++ b/astropy/table/table.py
+@@ -115,6 +115,7 @@ class Table:
+     def read(cls, filename, **kwargs):
+         """
+         Read a table from a file.
++
+         Parameters
+         ----------
+         filename : str or file-like object
+@@ -124,6 +125,18 @@ class Table:
+             File name or file-like object to read the table from.
+         """
+ 
++        if 'mask' in kwargs and not kwargs['mask']:
++            from astropy.io.fits.connect import read_table_fits
++            return read_table_fits(filename, **kwargs)
++
+         # Check if the file-like object is a fits file
+         if isinstance(filename, str) and filename.lower().endswith(('.fits', '.fits.gz', '.fit', '.fit.gz', '.fts', '.fts.gz')):
+             from astropy.io.fits.connect import read_table_fits
+             return read_table_fits(filename, **kwargs)
+ 
++        # Default behavior for other file formats
++        from astropy.io.ascii import read
++        return read(filename, **kwargs)
++
+ 
+     def write(self, filename, format='ascii', **kwargs):
+         """
+</patch>

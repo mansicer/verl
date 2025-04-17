@@ -1,0 +1,54 @@
+<patch>
+--- a/astropy/modeling/physical_models.py
++++ b/astropy/modeling/physical_models.py
+@@ -71,7 +71,7 @@ class BlackBody(Fittable1DModel):
+         if hasattr(self.scale, "unit") and self.scale.unit is not None:
+             # check that the units on scale are covertable to surface brightness units
+             if not self.scale.unit.is_equivalent(bb_unit, u.spectral_density(x)):
+-                raise ValueError(
++                warnings.warn(
+                     f"scale units not surface brightness: {self.scale.unit}"
+                 )
+             # use the scale passed to get the value for scaling
+@@ -80,7 +80,7 @@ class BlackBody(Fittable1DModel):
+                 mult_scale = scale.value
+             else:
+                 mult_scale = scale
+-            bb_unit = self.scale.unit
++            bb_unit = u.erg / (u.cm ** 2 * u.s * u.Hz * u.sr)
+         else:
+             mult_scale = scale
+  # Check if input values are physically possible
+@@ -142,7 +142,7 @@ class BlackBody(Fittable1DModel):
+         return native_bolflux.to(u.erg / (u.cm ** 2 * u.s))
+ 
+     @property
+-    def lambda_max(self):
++    def lambda_max(self, x):
+         """Peak wavelength when the curve is expressed as power density."""
+         return const.b_wien / self.temperature
+  # The input units are those of the 'x' value, which should always be
+@@ -161,7 +161,7 @@ class BlackBody(Fittable1DModel):
+             return {self.inputs[0]: u.Hz}
+ 
+     def _parameter_units_for_data_units(self, inputs_unit, outputs_unit):
+-        return {"temperature": u.K}
++        return {"temperature": u.K, "x": u.Hz}
+ 
+     @property
+     def bolometric_flux(self):
+@@ -172,7 +172,7 @@ class BlackBody(Fittable1DModel):
+         # bolometric flux in the native units of the planck function
+         native_bolflux = (
+             self.scale.value * const.sigma_sb * self.temperature ** 4 / np.pi
+-        )
++        ) * self.scale.unit
+         # return in more "astro" units
+         return native_bolflux.to(u.erg / (u.cm ** 2 * u.s))
+ 
+     @property
+     def nu_max(self):
+         """Peak frequency when the curve is expressed as power density."""
+-        return 2.8214391 * const.k_B * self.temperature / const.h
++        return 2.8214391 * const.k_B * self.temperature / const.h * self.scale.unit
+</patch>

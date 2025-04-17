@@ -65,7 +65,8 @@ class NaiveRewardManager:
 
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
 
-            extra_info = data_item.non_tensor_batch.get('extra_info', None)
+            extra_info = data_item.non_tensor_batch.get('extra_info', dict())
+            extra_info.update(data_item.non_tensor_batch['reward_model'])
 
             score = self.compute_score(
                 data_source=data_source,

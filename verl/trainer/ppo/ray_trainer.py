@@ -31,10 +31,11 @@ from tqdm import tqdm
 
 import ray
 import numpy as np
+import wandb
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoItem
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -73,6 +74,22 @@ class AdvantageEstimator(str, Enum):
     REINFORCE_PLUS_PLUS_BASELINE = 'reinforce_plus_plus_baseline'
     REMAX = 'remax'
     RLOO = 'rloo'
+
+
+def dataprotoitem_to_dataproto(item: DataProtoItem) -> DataProto:
+    """Convert a DataProtoItem to a DataProto object"""
+    return DataProto.from_dict(
+        tensors=item.batch,  # TensorDict is already in correct format
+        non_tensors=item.non_tensor_batch,  # Dict is already in correct format 
+        meta_info=item.meta_info)
+
+
+def dataprotoitem_to_dataproto(item: DataProtoItem) -> DataProto:
+    """Convert a DataProtoItem to a DataProto object"""
+    return DataProto.from_dict(
+        tensors=item.batch,  # TensorDict is already in correct format
+        non_tensors=item.non_tensor_batch,  # Dict is already in correct format 
+        meta_info=item.meta_info)
 
 
 @dataclass
@@ -478,8 +495,8 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
-        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
+    def _maybe_log_val_generations_to_wandb(self, inputs, outputs, scores, data_sources=None):
+        """Log a table of validation samples to wandb, grouped by data source"""
 
         generations_to_log = self.config.trainer.log_val_generations
 
@@ -488,19 +505,55 @@ class RayPPOTrainer(object):
 
         import numpy as np
 
-        # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
+        # Create tuples of (input, output, score, data_source) and sort by input text
+        data_sources = data_sources if data_sources else ['unknown'] * len(inputs)
+        samples = list(zip(inputs, outputs, scores, data_sources))
 
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
+        # Create a dictionary to store samples by data source
+        data_source_samples = {}
+        for sample in samples:
+            data_source = sample[3]  # The data source is the 4th element
+            if data_source not in data_source_samples:
+                data_source_samples[data_source] = []
+            data_source_samples[data_source].append(sample)
 
-        # Take first N samples after shuffling
-        samples = samples[:generations_to_log]
+        # Log each data source separately
+        for data_source, source_samples in data_source_samples.items():
+            # Sort samples by input text
+            source_samples.sort(key=lambda x: x[0])
 
-        # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+            # Use fixed random seed for deterministic shuffling
+            rng = np.random.RandomState(42)
+            rng.shuffle(source_samples)
+
+            # Take first N samples after shuffling
+            source_samples = source_samples[:generations_to_log]
+
+            # Create column names for all samples
+            columns = ["step"] + sum(
+                [[f"input_{i+1}", f"output_{i+1}", f"score_{i+1}"] for i in range(len(source_samples))], [])
+
+            table_attr_name = f'validation_table_{data_source}'
+            if not hasattr(self, table_attr_name):
+                # Initialize the table on first call
+                setattr(self, table_attr_name, wandb.Table(columns=columns))
+
+            # Create a new table with same columns and existing data
+            existing_table = getattr(self, table_attr_name)
+            new_table = wandb.Table(columns=columns, data=existing_table.data)
+
+            # Add new row with all data
+            row_data = []
+            row_data.append(self.global_steps)
+            for sample in source_samples:
+                # Only include the first 3 elements (input, output, score)
+                row_data.extend(sample[:3])
+
+            new_table.add_data(*row_data)
+
+            # Update reference and log
+            wandb.log({f"val/generations/{data_source}": new_table}, step=self.global_steps)
+            setattr(self, table_attr_name, new_table)
 
     def _validate(self):
         data_source_lst = []
@@ -574,9 +627,15 @@ class RayPPOTrainer(object):
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
 
+            # Get data sources
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        # Flatten data_source_lst for the generations logging
+        flattened_data_sources = [src for batch_sources in data_source_lst for src in batch_sources]
+        self._maybe_log_val_generations_to_wandb(inputs=sample_inputs,
+                                                 outputs=sample_outputs,
+                                                 scores=sample_scores,
+                                                 data_sources=flattened_data_sources)
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
@@ -766,12 +825,12 @@ class RayPPOTrainer(object):
 
         # load dataloader,
         # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
-        else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        # dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
+        # if os.path.exists(dataloader_local_path):
+        #     dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+        #     self.train_dataloader.load_state_dict(dataloader_state_dict)
+        # else:
+        #     print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -924,7 +983,55 @@ class RayPPOTrainer(object):
 
                         print(f'{list(reward_extra_infos_dict.keys())=}')
                         if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            metrics.update({f"train/reward/{k}": np.array(v).mean() for k, v in reward_extra_infos_dict.items()})
+
+                        # NOTE: adapt from deepscaler https://github.com/agentica-project/deepscaler/blob/main/verl/verl/trainer/ppo/ray_trainer.py#L627
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO:
+                            # Rejection sampling based on rewards
+                            # Group rewards by uid
+                            uids = batch.non_tensor_batch['uid']
+                            unique_uids = np.unique(uids)
+                            valid_mask = torch.ones(len(uids), dtype=torch.bool)
+                            reward_dict = {}
+                            for uid in unique_uids:
+                                uid_mask = uids == uid
+                                uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
+                                unique_rewards = np.unique(uid_rewards)
+                                if len(unique_rewards) == 1:
+                                    valid_mask[uid_mask] = False
+                                    reward_dict[unique_rewards[0]] = reward_dict.get(unique_rewards[0], 0) + 1
+
+                            # Log to metrics
+                            for reward, count in reward_dict.items():
+                                if len(reward_dict) <= 10:
+                                    metrics[f"batch/reward_{reward}_ratio"] = count / len(unique_uids)
+                            metrics["batch/valid_ratio"] = torch.sum(valid_mask).item() / len(unique_uids)
+
+                            if self.config.trainer.rejection_sample:
+                                # If no valid samples remain, skip this batch and get a new one
+                                if not valid_mask.any():
+                                    print(f"no valid sample, just continue: {reward_dict=}")
+                                    continue
+
+                                # Filter batch to keep only valid samples
+                                print(
+                                    f"before rejection sampling batch size: {batch.batch['input_ids'].shape[0]}, after rejection sampling batch size: {torch.sum(valid_mask).item()}"
+                                )
+                                batch = batch[valid_mask]
+                                batch = dataprotoitem_to_dataproto(batch)
+                                # Round down to the nearest multiple of world size
+                                num_trainer_replicas = self.actor_rollout_wg.world_size
+                                max_batch_size = (batch.batch['input_ids'].shape[0] //
+                                                  num_trainer_replicas) * num_trainer_replicas
+                                if not max_batch_size:
+                                    # give up, you got everything either all wrong or right.
+                                    print(f"max_batch_size is: {max_batch_size}, just continue")
+                                    continue
+                                size_mask = torch.zeros(batch.batch['input_ids'].shape[0], dtype=torch.bool)
+                                size_mask[:max_batch_size] = True
+                                batch = batch[size_mask]
+                                batch = dataprotoitem_to_dataproto(batch)
+
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
