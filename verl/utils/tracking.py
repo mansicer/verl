@@ -37,8 +37,8 @@ class Tracking(object):
         self.logger = {}
 
         if 'tracking' in default_backend or 'wandb' in default_backend:
-            import wandb
-            wandb.init(project=project_name, name=experiment_name, config=config)
+            import wandb, os
+            wandb.init(project=project_name, name=experiment_name, config=config, entity=config["trainer"].get("wandb_entity", None))
             self.logger['wandb'] = wandb
 
         if 'mlflow' in default_backend:
