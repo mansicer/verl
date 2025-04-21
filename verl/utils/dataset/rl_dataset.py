@@ -221,9 +221,16 @@ class RLHFDataset(Dataset):
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
 
-        row_dict["input_ids"] = input_ids[0]
-        row_dict["attention_mask"] = attention_mask[0]
-        row_dict["position_ids"] = position_ids[0]
+        row_dict['input_ids'] = input_ids[0]
+        row_dict['attention_mask'] = attention_mask[0]
+        row_dict['position_ids'] = position_ids[0]
+        row_dict["raw_prompt_str"] = raw_prompt
+        # Extract the last user message from the chat
+        user_messages = [msg for msg in messages if msg['role'] == 'user']
+        if user_messages:
+            row_dict["raw_problem"] = user_messages[-1]['content']
+        else:
+            row_dict["raw_problem"] = ""
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:

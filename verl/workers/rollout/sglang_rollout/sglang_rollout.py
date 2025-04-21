@@ -272,6 +272,8 @@ class SGLangRollout(BaseRollout):
         image_list = [input_data.get("image_data", None) for input_data in sglang_inputs]
 
         do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get('validate', False)
+
         if not do_sample:
             kwargs = dict(
                 n=1,
@@ -287,6 +289,14 @@ class SGLangRollout(BaseRollout):
                 skip_special_tokens=True,
                 spaces_between_special_tokens=True,
             )
+        if is_validate:
+            kwargs = {
+                'top_k': self.config.val_kwargs.top_k,
+                'top_p': self.config.val_kwargs.top_p,
+                'temperature': self.config.val_kwargs.temperature,
+                'n': 1,  # if validate, already repeat in ray_trainer
+            }
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             print(f"{self.sampling_params=}")

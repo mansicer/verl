@@ -117,6 +117,27 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+
+    # Add data source specific metrics if multiple data sources exist
+    data_source = batch.non_tensor_batch.get('data_source', ['unknown'] * prompt_length.shape[0])
+    data_sources_lst = np.unique(data_source)
+    for ds in data_sources_lst:
+        source_mask = data_source == ds
+
+        # Filter metrics by data source
+        source_sequence_score = sequence_score[source_mask]
+        source_sequence_reward = sequence_reward[source_mask] 
+        source_response_length = response_length[source_mask]
+        source_prompt_length = prompt_length[source_mask]
+
+        # Add source-specific metrics
+        metrics.update({
+            f'critic/score/{ds}/mean': torch.mean(source_sequence_score).detach().item(),
+            f'critic/rewards/{ds}/mean': torch.mean(source_sequence_reward).detach().item(),
+            f'response_length/{ds}/mean': torch.mean(source_response_length).detach().item(),
+            f'prompt_length/{ds}/mean': torch.mean(source_prompt_length).detach().item(),
+        })
+    
     return metrics
 
 
@@ -218,7 +239,7 @@ def process_validation_metrics(
                 metric = {}
                 n_resps = len(var_vals)
                 metric[f"mean@{n_resps}"] = np.mean(var_vals)
-                metric[f"std@{n_resps}"] = np.std(var_vals)
+                # metric[f"std@{n_resps}"] = np.std(var_vals)
 
                 ns = []
                 n = 2
@@ -229,21 +250,24 @@ def process_validation_metrics(
 
                 for n in ns:
                     # Best/Worst-of-N
-                    [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
-                        data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
-                    )
-                    metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
-                    metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
+                    [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(data=var_vals,
+                                                                                  subset_size=n,
+                                                                                  reduce_fns=[np.max, np.min],
+                                                                                  seed=seed)
+                    # metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
+                    metric[f"best@{n}/mean"] = bon_mean
+                    # metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
+                    # metric[f"worst@{n}/mean"] = won_mean
                     # Majority voting
                     if var2vals.get("pred", None) is not None:
                         vote_data = [{"val": val, "pred": pred} for val, pred in zip(var_vals, var2vals["pred"])]
-                        [(maj_n_mean, maj_n_std)] = bootstrap_metric(
-                            data=vote_data,
-                            subset_size=n,
-                            reduce_fns=[partial(calc_maj_val, vote_key="pred", val_key="val")],
-                            seed=seed,
-                        )
-                        metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
+                        [(maj_n_mean, maj_n_std)
+                        ] = bootstrap_metric(data=vote_data,
+                                             subset_size=n,
+                                             reduce_fns=[partial(calc_maj_val, vote_key="pred", val_key="val")],
+                                             seed=seed)
+                        # metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
+                        metric[f"maj@{n}/mean"] = maj_n_mean
 
                 data_src2prompt2var2metric[data_source][prompt][var_name] = metric
 
