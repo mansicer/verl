@@ -1,6 +1,7 @@
 import os
 
 VERIFICATION_REWARD_TYPE = os.getenv("VERIFICATION_REWARD_TYPE", "baseline")
+AUXILIARY_REWARDS = os.getenv("AUXILIARY_REWARD_TYPE", "none")
 
 import re
 try:
@@ -61,10 +62,16 @@ def qwen_math_reward(data_source, solution_str, ground_truth, extra_info=None):
     label = verify(gt, pred)
     reward += float(label)
 
-    code_blocks = re.findall(r'```python[\s\S]*?```', solution_str)
-    reward_dict["contain_code"] = len(code_blocks) > 0
-    if reward_dict["contain_code"]:
-        reward -= 0.5
+    if AUXILIARY_REWARDS == "none":
+        pass
+    elif "no_code" in AUXILIARY_REWARDS:
+        code_blocks = re.findall(r'```python[\s\S]*?```', solution_str)
+        reward_dict["contain_code"] = len(code_blocks) > 0
+        if reward_dict["contain_code"]:
+            reward -= 0.5
+    else:
+        raise NotImplementedError(f"Auxiliary reward is not implemented for {AUXILIARY_REWARDS=}")
+
     reward_dict["score"] = reward
     return reward_dict
 
@@ -125,15 +132,21 @@ def train_verification_reward(data_source, solution_str, ground_truth, extra_inf
             return False
         return True
 
-    # check if the model gives a consistent answer
-    reward_dict["consistent_verification"] = check_consistency(text)
-    if not reward_dict["consistent_verification"]:
-        reward -= 0.5
+    if AUXILIARY_REWARDS == "none":
+        pass
+    elif "consistency" in AUXILIARY_REWARDS:
+        # check if the model gives a consistent answer
+        reward_dict["consistent_verification"] = check_consistency(text)
+        if not reward_dict["consistent_verification"]:
+            reward -= 0.5
+    elif "non_short_response" in AUXILIARY_REWARDS:
+        # penalty for short response
+        reward_dict["non_short_response"] = len(solution_str) >= 40
+        if not reward_dict["non_short_response"]:
+            reward -= 0.5
+    else:
+        raise NotImplementedError(f"Auxiliary reward is not implemented for {AUXILIARY_REWARDS=}")
 
-    # penalty for short response
-    reward_dict["non_short_response"] = len(solution_str) >= 40
-    if not reward_dict["non_short_response"]:
-        reward -= 0.5
     reward_dict["score"] = reward
     return reward_dict
 
