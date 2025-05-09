@@ -18,6 +18,7 @@ Single Process Actor
 import itertools
 from typing import Tuple
 
+import numpy as np
 import torch
 from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 from torch import nn
@@ -322,11 +323,14 @@ class DataParallelPPOActor(BasePPOActor):
                     clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
+                    use_adaptive_entropy_adjustment = self.config.get("use_adaptive_entropy_adjustment", False)
+                    target_entropy = self.config.get("target_entropy", None)
+                    entropy_coeff_delta = self.config.get("entropy_coeff_delta", None)
+                    max_entropy_coeff = self.config.get("max_entropy_coeff", None)
+                    min_entropy_coeff = self.config.get("min_entropy_coeff", None)
 
                     # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
+                    calculate_entropy = entropy_coeff != 0 or use_adaptive_entropy_adjustment
                     entropy, log_prob = self._forward_micro_batch(
                         micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy
                     )
@@ -343,10 +347,21 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                     )
 
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
+                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    if use_adaptive_entropy_adjustment:
                         # compute policy loss
+                        if entropy_loss.detach().item() > target_entropy:
+                            self.config.entropy_coeff -= entropy_coeff_delta
+                            entropy_coeff = 0
+                        else:
+                            self.config.entropy_coeff += entropy_coeff_delta
+                            entropy_coeff = self.config.entropy_coeff
+                        entropy_coeff = float(np.clip(entropy_coeff, min_entropy_coeff, max_entropy_coeff))
+
+                        metrics["actor/entropy_coeff"] = entropy_coeff
+                        metrics["actor/entropy_loss"] = entropy_loss.detach().item()
+
+                    if entropy_coeff != 0:
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss

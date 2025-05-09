@@ -1,7 +1,9 @@
 import os
 
-VERIFICATION_REWARD_TYPE = os.getenv("VERIFICATION_REWARD_TYPE", "baseline")
-AUXILIARY_REWARDS = os.getenv("AUXILIARY_REWARD_TYPE", "none")
+VERIFICATION_REWARD_TYPE = os.environ.get("VERIFICATION_REWARD_TYPE", "baseline")
+AUXILIARY_REWARDS = os.environ.get("AUXILIARY_REWARDS", "none")
+
+print(f"Reward info: {VERIFICATION_REWARD_TYPE=} {AUXILIARY_REWARDS=}")
 
 import re
 try:
@@ -44,12 +46,15 @@ def compute_score(data_source, solution_str, ground_truth, extra_info):
 
 
 def math_verify_reward(data_source, solution_str, ground_truth, extra_info=None):
-    pred = parse(solution_str)
-    if "gsm8k" in data_source:
-        gt = parse(ground_truth)
-    else:
-        gt = parse(f"${ground_truth}$")
-    res = verify(gt, pred)
+    try:
+        pred = parse(solution_str)
+        if "gsm8k" in data_source:
+            gt = parse(ground_truth)
+        else:
+            gt = parse(f"${ground_truth}$")
+        res = verify(gt, pred)
+    except TimeoutException as e:
+        res = False
     return dict(score=float(res))
 
 
@@ -57,20 +62,19 @@ def qwen_math_reward(data_source, solution_str, ground_truth, extra_info=None):
     reward = 0.0
     reward_dict = {}
 
-    pred = parse(solution_str)
-    gt = parse(f"${ground_truth}$")
-    label = verify(gt, pred)
+    try:
+        pred = parse(solution_str)
+        gt = parse(f"${ground_truth}$")
+        label = verify(gt, pred)
+    except TimeoutException as e:
+        label = False
     reward += float(label)
 
-    if AUXILIARY_REWARDS == "none":
-        pass
-    elif "no_code" in AUXILIARY_REWARDS:
+    if "no_code" in AUXILIARY_REWARDS:
         code_blocks = re.findall(r'```python[\s\S]*?```', solution_str)
         reward_dict["contain_code"] = len(code_blocks) > 0
         if reward_dict["contain_code"]:
             reward -= 0.5
-    else:
-        raise NotImplementedError(f"Auxiliary reward is not implemented for {AUXILIARY_REWARDS=}")
 
     reward_dict["score"] = reward
     return reward_dict
@@ -104,6 +108,7 @@ def train_verification_reward(data_source, solution_str, ground_truth, extra_inf
     
     output = extract_yes_no(text)
     reward_dict["valid_verification_form"] = output is not None
+    
     if reward_dict["valid_verification_form"]:
         if VERIFICATION_REWARD_TYPE == "baseline":
             reward = label == output
@@ -132,20 +137,16 @@ def train_verification_reward(data_source, solution_str, ground_truth, extra_inf
             return False
         return True
 
-    if AUXILIARY_REWARDS == "none":
-        pass
-    elif "consistency" in AUXILIARY_REWARDS:
+    if "consistency" in AUXILIARY_REWARDS:
         # check if the model gives a consistent answer
         reward_dict["consistent_verification"] = check_consistency(text)
         if not reward_dict["consistent_verification"]:
             reward -= 0.5
-    elif "non_short_response" in AUXILIARY_REWARDS:
+    if "non_short_response" in AUXILIARY_REWARDS:
         # penalty for short response
         reward_dict["non_short_response"] = len(solution_str) >= 40
         if not reward_dict["non_short_response"]:
             reward -= 0.5
-    else:
-        raise NotImplementedError(f"Auxiliary reward is not implemented for {AUXILIARY_REWARDS=}")
 
     reward_dict["score"] = reward
     return reward_dict

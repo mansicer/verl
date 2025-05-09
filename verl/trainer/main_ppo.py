@@ -92,6 +92,9 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
 
+        os.environ["VERIFICATION_REWARD_TYPE"] = config.reward_config.verification_reward_type
+        os.environ["AUXILIARY_REWARDS"] = config.reward_config.auxiliary_rewards
+
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
 

@@ -977,9 +977,9 @@ class RayPPOTrainer:
             if reward_value == 1.0 or reward_value == 0.0:
                 self.online_saved_data.append(dict(problem=problem, response=response, score=bool(reward_value), correct_ratio=correct_ratio))
                 count += 1
-        print(f"Add {count} valid samples to online dataset")
+        print(f"Add {count} valid samples to online dataset, current size: {len(self.online_saved_data)}")
 
-    def _record_online_data(self, current_epoch):
+    def _record_online_data(self):
         import datasets
         dataset = datasets.Dataset.from_list(self.online_saved_data)
 
@@ -1034,8 +1034,8 @@ class RayPPOTrainer:
         train_dataset = train_dataset.map(make_map_fn(self.config.trainer.save_online_data.data_source, "train"), with_indices=True)
         test_dataset = test_dataset.map(make_map_fn(self.config.trainer.save_online_data.data_source, "test"), with_indices=True)
 
-        train_path = os.path.join(self.config.trainer.save_online_data.path, f"train-epoch-{current_epoch}.parquet")
-        test_path = os.path.join(self.config.trainer.save_online_data.path, f"val-epoch-{current_epoch}.parquet")
+        train_path = os.path.join(self.config.trainer.save_online_data.path, f"train-step-{self.global_steps}.parquet")
+        test_path = os.path.join(self.config.trainer.save_online_data.path, f"val-step-{self.global_steps}.parquet")
         train_dataset.to_parquet(train_path)
         test_dataset.to_parquet(test_path)
         train_dataset.to_parquet(os.path.join(self.config.trainer.save_online_data.path, "train-latest.parquet"))
@@ -1385,7 +1385,7 @@ class RayPPOTrainer:
 
                 if self.config.trainer.save_online_data.enabled and (self.global_steps % self.config.trainer.save_online_data.online_save_freq == 0):
                     print(f"Saving online data")
-                    self._record_online_data(current_epoch=epoch)
+                    self._record_online_data()
                     print(f"Resetting dataloader")
                     self._reset_dataloader()
 

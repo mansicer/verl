@@ -44,6 +44,11 @@ actor_rollout_ref:
     clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
     entropy_coeff: 0
+    use_adaptive_entropy_adjustment: False
+    target_entropy: null
+    entropy_coeff_delta: null
+    max_entropy_coeff: 0.005
+    min_entropy_coeff: 0
     use_kl_loss: False # True for GRPO
     use_torch_compile: True # False to disable torch compile
     kl_loss_coef: 0.001 # for grpo
@@ -183,6 +188,10 @@ reward_model:
 custom_reward_function:
   path: null
   name: compute_score
+
+reward_config:
+  verification_reward_type: baseline
+  auxiliary_rewards: ""
 
 algorithm:
   gamma: 1.0
