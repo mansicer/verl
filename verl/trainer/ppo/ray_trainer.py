@@ -518,10 +518,6 @@ class RayPPOTrainer:
             processor=self.processor,
             config=self.config.data,
         )
-        if self.config.trainer.save_online_data.enabled:
-            self.online_data_size = int(
-                len(self.train_dataset) * self.config.trainer.save_online_data.train_data_save_ratio)
-            print(f"Online data saved size: {self.online_data_size}")
 
         assert self.train_dataset.truncation == self.config.data.get(
             'truncation', 'error'
@@ -533,9 +529,6 @@ class RayPPOTrainer:
             sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
-        
-        if self.config.trainer.save_online_data.enabled:
-            self.online_data_size = int(len(self.train_dataset) * self.config.trainer.save_online_data.train_data_save_ratio)
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
@@ -1029,7 +1022,7 @@ class RayPPOTrainer:
 
         train_test = dataset.train_test_split(test_size=self.config.trainer.save_online_data.val_data_size)
         train_dataset = train_test['train'].shuffle()
-        train_dataset = train_dataset.select(range(min(self.online_data_size, len(train_dataset))))
+        train_dataset = train_dataset.select(range(min(self.config.trainer.save_online_data.train_data_size, len(train_dataset))))
         test_dataset = train_test['test']
         train_dataset = train_dataset.map(make_map_fn(self.config.trainer.save_online_data.data_source, "train"), with_indices=True)
         test_dataset = test_dataset.map(make_map_fn(self.config.trainer.save_online_data.data_source, "test"), with_indices=True)
@@ -1079,12 +1072,8 @@ class RayPPOTrainer:
             config=self.config.data,
         )
         # use sampler for better ckpt resume
-        if self.config.data.shuffle:
-            train_dataloader_generator = torch.Generator()
-            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
-            sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
-        else:
-            sampler = SequentialSampler(data_source=self.train_dataset)
+        train_dataloader_generator = torch.Generator()
+        sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
 
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                                    batch_size=self.config.data.train_batch_size,
