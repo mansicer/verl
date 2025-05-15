@@ -587,7 +587,7 @@ class RayPPOTrainer:
 
         import numpy as np
 
-        # Create tuples of (input, output, score, data_source) and sort by input text
+        # Create tuples of (input, output, score, data_source)
         data_sources = data_sources if data_sources else ['unknown'] * len(inputs)
         samples = list(zip(inputs, outputs, scores, data_sources))
 
@@ -611,9 +611,10 @@ class RayPPOTrainer:
             # Take first N samples after shuffling
             source_samples = source_samples[:generations_to_log]
 
-            # Create column names for all samples
+            # Always use the same number of columns (based on generations_to_log)
             columns = ["step"] + sum(
-                [[f"input_{i+1}", f"output_{i+1}", f"score_{i+1}"] for i in range(len(source_samples))], [])
+                [[f"input_{i+1}", f"output_{i+1}", f"score_{i+1}"] for i in range(generations_to_log)], []
+            )
 
             table_attr_name = f'validation_table_{data_source}'
             if not hasattr(self, table_attr_name):
@@ -624,12 +625,13 @@ class RayPPOTrainer:
             existing_table = getattr(self, table_attr_name)
             new_table = wandb.Table(columns=columns, data=existing_table.data)
 
-            # Add new row with all data
-            row_data = []
-            row_data.append(self.global_steps)
-            for sample in source_samples:
-                # Only include the first 3 elements (input, output, score)
-                row_data.extend(sample[:3])
+            # Add new row with all data, pad with empty strings if not enough samples
+            row_data = [self.global_steps]
+            for i in range(generations_to_log):
+                if i < len(source_samples):
+                    row_data.extend(source_samples[i][:3])
+                else:
+                    row_data.extend(["", "", ""])
 
             new_table.add_data(*row_data)
 
